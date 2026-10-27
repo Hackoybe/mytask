@@ -1,0 +1,221 @@
+import asyncio
+import logging
+import sqlite3
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# Bot tokeningizni shu yerga yozing
+TOKEN = "8861937632:AAFFERPjy9er8jyRtOJqU7VVrpjD_mdTnwI"
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+scheduler = AsyncIOScheduler()
+
+# Tayyor tugmalar ro'yxati
+PRESET_TASKS = [
+    "Ovqatlanish", "Aylanish", "Yugurish", "Uxlash",
+    "Ishlash", "Muhim ishlarni bajarish", "Tanaffus",
+    "AI sohasini o'rganish", "Til o'rganish", "Video va foto sohasini o'rganish"
+]
+
+# --- BAZA BILAN ISHLASH ---
+def init_db():
+    conn = sqlite3.connect("vazifalar.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS vazifalar (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            vazifa_matni TEXT,
+            vaqt TEXT,
+            status TEXT DEFAULT 'pending',
+            notified INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# --- HOLATLAR (FSM) ---
+class VazifaState(StatesGroup):
+    waiting_for_time = State()
+
+# --- ASOSIY MENYU ---
+def main_menu():
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Vazifa qo'shish", callback_data="add_vazifa")],
+        [InlineKeyboardButton(text="📋 Ertangi va bugungi vazifalarim", callback_data="list_vazifalar")]
+    ])
+    return keyboard
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "Salom! Kunlik vazifalaringizni vaqt kesimida boshqarish va o'z vaqtida eslatib turish uchun tayyorman.",
+        reply_markup=main_menu()
+    )
+
+@dp.callback_query(F.data == "main_menu")
+async def back_to_menu(callback: types.CallbackQuery):
+    await callback.message.edit_text("Asosiy menyu:", reply_markup=main_menu())
+    await callback.answer()
+
+# --- TAYYOR TUGMALARDAN TANLASH ---
+@dp.callback_query(F.data == "add_vazifa")
+async def select_preset_vazifa(callback: types.CallbackQuery):
+    buttons = [[KeyboardButton(text=task)] for task in PRESET_TASKS]
+    keyboard = ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True, one_time_keyboard=True)
+
+    await callback.message.answer(
+        "Quyidagi tayyor vazifalardan birini tanlang yoki o'zingiz yozib yuboring:",
+        reply_markup=keyboard
+    )
+    await callback.answer()
+
+@dp.message(F.text.in_(PRESET_TASKS) | F.text)
+async def get_vazifa_text(message: types.Message, state: FSMContext):
+    # Agar foydalanuvchi menyudan tugma bosgan bo'lsa yoki o'zi yozgan bo'lsa
+    await state.update_data(vazifa_matni=message.text)
+
+    # Klaviaturani yopamiz
+    remove_kb = types.ReplyKeyboardRemove()
+
+    await message.answer(
+        f"Tanlangan vazifa: *{message.text}*\n\n"
+        "Endi bu vazifa qaysi **vaqtda** bajarilishini yozing.\n"
+        "*(Format: SS:MM, masalan: `14:30` yoki `09:00`)*",
+        reply_markup=remove_kb,
+        parse_mode="Markdown"
+    )
+    await state.set_state(VazifaState.waiting_for_time)
+
+@dp.message(VazifaState.waiting_for_time)
+async def save_vazifa_time(message: types.Message, state: FSMContext):
+    time_text = message.text.strip()
+
+    # Vaqt formatini oddiy tekshirish
+    try:
+        datetime.strptime(time_text, "%H:%M")
+    except ValueError:
+        await message.answer("❌ Vaqt noto'g'ri kiritildi! Iltimos, `SS:MM` formatida kiriting (masalan: `14:30`):")
+        return
+
+    data = await state.get_data()
+    vazifa_matni = data.get("vazifa_matni")
+    user_id = message.from_user.id
+
+    conn = sqlite3.connect("vazifalar.db")
+    cursor = conn.cursor()
+    cursor.execute(
+        "INSERT INTO vazifalar (user_id, vazifa_matni, vaqt, status, notified) VALUES (?, ?, ?, 'pending', 0)",
+        (user_id, vazifa_matni, time_text)
+    )
+    conn.commit()
+    conn.close()
+
+    await state.clear()
+    await message.answer(
+        f"✅ Muvaffaqiyatli saqlandi!\n\n"
+        f"📌 Vazifa: *{vazifa_matni}*\n"
+        f"⏰ Vaqti: *{time_text}*\n\n"
+        "Bu vazifani bir kun oldindan kiritdingiz, belgilangan vaqtdan 10 minut oldin eslataman!",
+        reply_markup=main_menu(),
+        parse_mode="Markdown"
+    )
+
+# --- VAZIFALARNI KO'RSATISH VA BOSHQARISH ---
+@dp.callback_query(F.data == "list_vazifalar")
+async def show_vazifalar(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    conn = sqlite3.connect("vazifalar.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, vazifa_matni, vaqt, status FROM vazifalar WHERE user_id = ? AND status = 'pending' ORDER BY vaqt ASC", (user_id,))
+    vazifalar = cursor.fetchall()
+    conn.close()
+
+    if not vazifalar:
+        await callback.message.answer("Hozircha rejalashtirilgan vazifalaringiz yo'q! 🎉", reply_markup=main_menu())
+        await callback.answer()
+        return
+
+    keyboard_buttons = []
+    for v_id, v_matni, v_vaqt, status in vazifalar:
+        keyboard_buttons.append([
+            InlineKeyboardButton(text=f"⏰ {v_vaqt} - {v_matni} (Bajarish ✅)", callback_data=f"vazifa_done_{v_id}")
+        ])
+
+    keyboard_buttons.append([InlineKeyboardButton(text="🔙 Asosiy menyu", callback_data="main_menu")])
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+
+    await callback.message.answer("Sizning rejalashtirilgan vazifalaringiz:", reply_markup=keyboard)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("vazifa_done_"))
+async def mark_vazifa_done(callback: types.CallbackQuery):
+    v_id = int(callback.data.split("_")[2])
+
+    conn = sqlite3.connect("vazifalar.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE vazifalar SET status = 'completed' WHERE id = ?", (v_id,))
+    conn.commit()
+    conn.close()
+
+    await callback.message.edit_text("✅ Vazifa bajarildi deb belgilandi!", reply_markup=main_menu())
+    await callback.answer()
+
+# --- ⏳ 10 MINUT OLDIN ESLatish TIZIMI (FONDA ISHLAYDI) ---
+async def check_schedule():
+    conn = sqlite3.connect("vazifalar.db")
+    cursor = conn.cursor()
+
+    now = datetime.now()
+    current_time_str = now.strftime("%H:%M")
+
+    # 10 minut keyingi vaqtni aniqlaymiz (10 minut oldin ogohlantirish uchun)
+    target_time = now + timedelta(minutes=10)
+    target_time_str = target_time.strftime("%H:%M")
+
+    # Bazadan hozirgi vaqtdan 10 minut keyinga belgilangan va hali xabar yuborilmagan vazifalarni olamiz
+    cursor.execute(
+        "SELECT id, user_id, vazifa_matni, vaqt FROM vazifalar WHERE vaqt = ? AND status = 'pending' AND notified = 0",
+        (target_time_str,)
+    )
+    vazifalar = cursor.fetchall()
+
+    for v_id, user_id, v_matni, v_vaqt in vazifalar:
+        try:
+            await bot.send_message(
+                user_id,
+                f"⚠️ **Diqqat! 10 minutdan keyin vaqt bo'ldi!**\n\n"
+                f"📌 Vazifa: *{v_matni}*\n"
+                f"⏰ Belgilangan vaqt: *{v_vaqt}*\n\n"
+                "Tayyorgarlikni ko'ring!",
+                parse_mode="Markdown"
+            )
+            # Xabar yuborildi deb belgilaymiz
+            cursor.execute("UPDATE vazifalar SET notified = 1 WHERE id = ?", (v_id,))
+            conn.commit()
+        except Exception as e:
+                logging.error(f"Xabar yuborishda xatolik: {e}")
+
+    conn.close()
+
+# --- ISHGA TUSHIRISH ---
+async def main():
+    # Har 1 minutda vaqtni tekshirib turadi
+    scheduler.add_job(check_schedule, "interval", minutes=1)
+    scheduler.start()
+
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
